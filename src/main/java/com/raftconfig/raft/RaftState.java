@@ -1,10 +1,11 @@
 package com.raftconfig.raft;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
+import com.raftconfig.raft.rpc.AppendEntriesRequest;
+import com.raftconfig.raft.rpc.AppendEntriesResponse;
 import com.raftconfig.raft.rpc.RequestVoteRequest;
 import com.raftconfig.raft.rpc.RequestVoteResponse;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Core Raft state for one node (Figure 2 of the Raft paper).
@@ -19,7 +20,7 @@ public class RaftState {
 
     private final String selfId;
 
-    // Persistent state (we'll save these to disk in Phase 3)
+    // Persistent state (saved to disk in Phase 3)
     private long currentTerm = 0;
     private String votedFor = null;
 
@@ -30,6 +31,8 @@ public class RaftState {
     public RaftState(String selfId) {
         this.selfId = selfId;
     }
+
+    // ---------- Role transitions ----------
 
     /**
      * Step down to follower. Called when we see a higher term,
@@ -45,6 +48,8 @@ public class RaftState {
         }
         if (role != Role.FOLLOWER) {
             log.info("term={} {} -> FOLLOWER (leader={})", currentTerm, role, newLeaderId);
+        } else if (newLeaderId != null && !newLeaderId.equals(leaderId)) {
+            log.info("term={} following leader {}", currentTerm, newLeaderId);
         }
         role = Role.FOLLOWER;
         leaderId = newLeaderId;
@@ -87,7 +92,9 @@ public class RaftState {
         }
         return false;
     }
-    
+
+    // ---------- RequestVote ----------
+
     /** Handle an incoming RequestVote RPC from a candidate. */
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest req) {
         // Rule 1: reject candidates from an older term
@@ -129,9 +136,31 @@ public class RaftState {
         return candLastIndex >= myLastIndex;
     }
 
-    // No log yet, so our log is empty. Phase 2 replaces these with the real log.
+    // ---------- AppendEntries ----------
+
+    /** Handle an incoming AppendEntries RPC (heartbeat for now). */
+    public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
+        // Rule 1: reject a stale leader
+        if (req.term() < currentTerm) {
+            log.debug("term={} reject AppendEntries from stale leader {} (term {})",
+                    currentTerm, req.leaderId(), req.term());
+            return new AppendEntriesResponse(currentTerm, false);
+        }
+
+        // Rule 2: valid leader for this term (or newer) -> recognize it.
+        // This also turns a candidate back into a follower.
+        becomeFollower(req.term(), req.leaderId());
+
+        // Phase 2: check prevLogIndex/prevLogTerm, append entries, advance commitIndex
+        return new AppendEntriesResponse(currentTerm, true);
+    }
+
+    // ---------- Log (empty until Phase 2) ----------
+
     public synchronized long lastLogIndex() { return 0; }
     public synchronized long lastLogTerm()  { return 0; }
+
+    // ---------- Reading state ----------
 
     public synchronized Snapshot snapshot() {
         return new Snapshot(selfId, currentTerm, role, votedFor, leaderId);

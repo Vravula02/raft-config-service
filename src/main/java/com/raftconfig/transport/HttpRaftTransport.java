@@ -1,6 +1,8 @@
 package com.raftconfig.transport;
 
 import com.raftconfig.raft.RaftTransport;
+import com.raftconfig.raft.rpc.AppendEntriesRequest;
+import com.raftconfig.raft.rpc.AppendEntriesResponse;
 import com.raftconfig.raft.rpc.RequestVoteRequest;
 import com.raftconfig.raft.rpc.RequestVoteResponse;
 import org.slf4j.Logger;
@@ -33,6 +35,11 @@ public class HttpRaftTransport implements RaftTransport {
     @Override
     public Optional<RequestVoteResponse> requestVote(String peerId, RequestVoteRequest req) {
         return post(peerId, "/raft/request-vote", req, RequestVoteResponse.class);
+    }
+
+    @Override
+    public Optional<AppendEntriesResponse> appendEntries(String peerId, AppendEntriesRequest req) {
+        return post(peerId, "/raft/append-entries", req, AppendEntriesResponse.class);
     }
 
     private <T> Optional<T> post(String peerId, String path, Object body, Class<T> responseType) {

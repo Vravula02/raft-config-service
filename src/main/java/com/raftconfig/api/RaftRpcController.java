@@ -1,6 +1,8 @@
 package com.raftconfig.api;
 
 import com.raftconfig.raft.RaftNode;
+import com.raftconfig.raft.rpc.AppendEntriesRequest;
+import com.raftconfig.raft.rpc.AppendEntriesResponse;
 import com.raftconfig.raft.rpc.RequestVoteRequest;
 import com.raftconfig.raft.rpc.RequestVoteResponse;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,5 +24,10 @@ public class RaftRpcController {
     @PostMapping("/request-vote")
     public RequestVoteResponse requestVote(@RequestBody RequestVoteRequest req) {
         return node.handleRequestVote(req);
+    }
+
+    @PostMapping("/append-entries")
+    public AppendEntriesResponse appendEntries(@RequestBody AppendEntriesRequest req) {
+        return node.handleAppendEntries(req);
     }
 }
