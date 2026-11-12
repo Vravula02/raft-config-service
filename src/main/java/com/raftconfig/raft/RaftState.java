@@ -7,12 +7,13 @@ import com.raftconfig.raft.rpc.RequestVoteResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+
 /**
  * Core Raft state for one node (Figure 2 of the Raft paper).
  *
  * Plain Java, no Spring, so it's easy to unit test.
- * Every method is synchronized: one lock guards all state.
- * Simple and correct first; Raft bugs are almost always races.
+ * Every method is synchronized: one lock guards all state, including the log.
  */
 public class RaftState {
 
@@ -23,6 +24,7 @@ public class RaftState {
     // Persistent state (saved to disk in Phase 3)
     private long currentTerm = 0;
     private String votedFor = null;
+    private final RaftLog raftLog = new RaftLog();
 
     // Volatile state
     private Role role = Role.FOLLOWER;
@@ -34,10 +36,6 @@ public class RaftState {
 
     // ---------- Role transitions ----------
 
-    /**
-     * Step down to follower. Called when we see a higher term,
-     * or hear from a valid leader in our current term.
-     */
     public synchronized void becomeFollower(long term, String newLeaderId) {
         if (term < currentTerm) {
             throw new IllegalStateException("Cannot go back in time: term " + term + " < " + currentTerm);
@@ -55,10 +53,6 @@ public class RaftState {
         leaderId = newLeaderId;
     }
 
-    /**
-     * Election timeout fired: start a new term and vote for ourselves.
-     * Returns the new term so the caller can request votes for it.
-     */
     public synchronized long becomeCandidate() {
         currentTerm++;
         votedFor = selfId;
@@ -68,10 +62,7 @@ public class RaftState {
         return currentTerm;
     }
 
-    /** Won a majority of votes in the given term. */
     public synchronized boolean becomeLeader(long electionTerm) {
-        // Only promote if we're still a candidate in the term we ran in.
-        // Votes can arrive late, after we've already moved on.
         if (role != Role.CANDIDATE || currentTerm != electionTerm) {
             return false;
         }
@@ -81,10 +72,6 @@ public class RaftState {
         return true;
     }
 
-    /**
-     * Any RPC or response carrying a higher term means we're out of date.
-     * Returns true if we stepped down.
-     */
     public synchronized boolean stepDownIfNewerTerm(long term) {
         if (term > currentTerm) {
             becomeFollower(term, null);
@@ -95,20 +82,15 @@ public class RaftState {
 
     // ---------- RequestVote ----------
 
-    /** Handle an incoming RequestVote RPC from a candidate. */
     public synchronized RequestVoteResponse handleRequestVote(RequestVoteRequest req) {
-        // Rule 1: reject candidates from an older term
         if (req.term() < currentTerm) {
             log.debug("term={} reject vote for {} (stale term {})", currentTerm, req.candidateId(), req.term());
             return new RequestVoteResponse(currentTerm, false);
         }
-
-        // Rule 2: newer term -> adopt it and step down (this also clears votedFor)
         if (req.term() > currentTerm) {
             becomeFollower(req.term(), null);
         }
 
-        // Rule 3: one vote per term, and only for an up-to-date log
         boolean canVote = votedFor == null || votedFor.equals(req.candidateId());
         boolean logOk = isCandidateLogUpToDate(req.lastLogIndex(), req.lastLogTerm());
 
@@ -124,12 +106,12 @@ public class RaftState {
     }
 
     /**
-     * Raft's "at least as up-to-date" check (section 5.4.1):
-     * higher last term wins; if equal terms, longer log wins.
+     * "At least as up-to-date" (section 5.4.1): higher last term wins;
+     * equal terms -> longer log wins. Now uses the real log.
      */
     private boolean isCandidateLogUpToDate(long candLastIndex, long candLastTerm) {
-        long myLastTerm = lastLogTerm();
-        long myLastIndex = lastLogIndex();
+        long myLastTerm = raftLog.lastTerm();
+        long myLastIndex = raftLog.lastIndex();
         if (candLastTerm != myLastTerm) {
             return candLastTerm > myLastTerm;
         }
@@ -138,38 +120,51 @@ public class RaftState {
 
     // ---------- AppendEntries ----------
 
-    /** Handle an incoming AppendEntries RPC (heartbeat for now). */
     public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
-        // Rule 1: reject a stale leader
         if (req.term() < currentTerm) {
             log.debug("term={} reject AppendEntries from stale leader {} (term {})",
                     currentTerm, req.leaderId(), req.term());
             return new AppendEntriesResponse(currentTerm, false);
         }
-
-        // Rule 2: valid leader for this term (or newer) -> recognize it.
-        // This also turns a candidate back into a follower.
         becomeFollower(req.term(), req.leaderId());
 
-        // Phase 2: check prevLogIndex/prevLogTerm, append entries, advance commitIndex
+        // Step 2: log consistency check + appending entries goes here
         return new AppendEntriesResponse(currentTerm, true);
     }
 
-    // ---------- Log (empty until Phase 2) ----------
+    // ---------- Log ----------
 
-    public synchronized long lastLogIndex() { return 0; }
-    public synchronized long lastLogTerm()  { return 0; }
+    /**
+     * Leader only: append a new command to our own log in the current term.
+     * Returns null if we're not the leader.
+     */
+    public synchronized LogEntry appendAsLeader(String command) {
+        if (role != Role.LEADER) {
+            return null;
+        }
+        LogEntry entry = raftLog.append(currentTerm, command);
+        log.info("term={} appended index={} command={}", currentTerm, entry.index(), command);
+        return entry;
+    }
+
+    public synchronized long lastLogIndex() { return raftLog.lastIndex(); }
+    public synchronized long lastLogTerm()  { return raftLog.lastTerm(); }
+
+    public synchronized List<LogEntry> logEntries() {
+        return raftLog.all();
+    }
 
     // ---------- Reading state ----------
 
     public synchronized Snapshot snapshot() {
-        return new Snapshot(selfId, currentTerm, role, votedFor, leaderId);
+        return new Snapshot(selfId, currentTerm, role, votedFor, leaderId,
+                raftLog.lastIndex(), raftLog.lastTerm());
     }
 
     public String selfId() {
         return selfId;
     }
 
-    /** Immutable copy of the state, safe to read outside the lock. */
-    public record Snapshot(String nodeId, long term, Role role, String votedFor, String leaderId) {}
+    public record Snapshot(String nodeId, long term, Role role, String votedFor, String leaderId,
+                           long lastLogIndex, long lastLogTerm) {}
 }

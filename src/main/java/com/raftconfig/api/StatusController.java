@@ -22,13 +22,14 @@ public class StatusController {
     @GetMapping("/status")
     public Map<String, Object> status() {
         RaftState.Snapshot s = state.snapshot();
-        // LinkedHashMap keeps field order and allows null values
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("nodeId", s.nodeId());
         out.put("role", s.role());
         out.put("term", s.term());
         out.put("leaderId", s.leaderId());
         out.put("votedFor", s.votedFor());
+        out.put("lastLogIndex", s.lastLogIndex());
+        out.put("lastLogTerm", s.lastLogTerm());
         out.put("clusterSize", props.clusterSize());
         out.put("quorum", props.quorum());
         return out;
