@@ -30,6 +30,7 @@ public class StatusController {
         out.put("votedFor", s.votedFor());
         out.put("lastLogIndex", s.lastLogIndex());
         out.put("lastLogTerm", s.lastLogTerm());
+        out.put("commitIndex", s.commitIndex());
         out.put("clusterSize", props.clusterSize());
         out.put("quorum", props.quorum());
         return out;

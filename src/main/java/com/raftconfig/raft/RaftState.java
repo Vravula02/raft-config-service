@@ -29,6 +29,7 @@ public class RaftState {
     // Volatile state
     private Role role = Role.FOLLOWER;
     private String leaderId = null;
+    private long commitIndex = 0;   // highest log index known to be committed
 
     public RaftState(String selfId) {
         this.selfId = selfId;
@@ -105,10 +106,7 @@ public class RaftState {
         return new RequestVoteResponse(currentTerm, false);
     }
 
-    /**
-     * "At least as up-to-date" (section 5.4.1): higher last term wins;
-     * equal terms -> longer log wins. Now uses the real log.
-     */
+    /** "At least as up-to-date" (section 5.4.1): higher last term wins; equal terms -> longer log wins. */
     private boolean isCandidateLogUpToDate(long candLastIndex, long candLastTerm) {
         long myLastTerm = raftLog.lastTerm();
         long myLastIndex = raftLog.lastIndex();
@@ -118,9 +116,10 @@ public class RaftState {
         return candLastIndex >= myLastIndex;
     }
 
-    // ---------- AppendEntries ----------
+    // ---------- AppendEntries (follower side) ----------
 
     public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
+        // Rule 1: reject a stale leader
         if (req.term() < currentTerm) {
             log.debug("term={} reject AppendEntries from stale leader {} (term {})",
                     currentTerm, req.leaderId(), req.term());
@@ -128,16 +127,39 @@ public class RaftState {
         }
         becomeFollower(req.term(), req.leaderId());
 
-        // Step 2: log consistency check + appending entries goes here
+        // Rule 2: consistency check - we must have the entry just before the new ones
+        if (raftLog.termAt(req.prevLogIndex()) != req.prevLogTerm()) {
+            log.debug("term={} log mismatch at prevLogIndex={} (want term {}, have {})",
+                    currentTerm, req.prevLogIndex(), req.prevLogTerm(), raftLog.termAt(req.prevLogIndex()));
+            return new AppendEntriesResponse(currentTerm, false);
+        }
+
+        // Rules 3 + 4: delete conflicting entries, append missing ones, skip ones we already have
+        for (LogEntry entry : req.entries()) {
+            long existingTerm = raftLog.termAt(entry.index());
+            if (existingTerm == -1) {
+                raftLog.appendReplicated(entry);
+            } else if (existingTerm != entry.term()) {
+                log.info("term={} conflict at index {} (have term {}, leader has {}), truncating",
+                        currentTerm, entry.index(), existingTerm, entry.term());
+                raftLog.truncateFrom(entry.index());
+                raftLog.appendReplicated(entry);
+            }
+            // else: identical entry already present (duplicate or retried RPC) -> skip
+        }
+
+        // Rule 5: advance commitIndex, but never past what this RPC proved we have
+        long lastNewIndex = req.prevLogIndex() + req.entries().size();
+        if (req.leaderCommit() > commitIndex) {
+            commitIndex = Math.min(req.leaderCommit(), lastNewIndex);
+        }
+
         return new AppendEntriesResponse(currentTerm, true);
     }
 
     // ---------- Log ----------
 
-    /**
-     * Leader only: append a new command to our own log in the current term.
-     * Returns null if we're not the leader.
-     */
+    /** Leader only: append a new command in the current term. Returns null if not leader. */
     public synchronized LogEntry appendAsLeader(String command) {
         if (role != Role.LEADER) {
             return null;
@@ -158,7 +180,7 @@ public class RaftState {
 
     public synchronized Snapshot snapshot() {
         return new Snapshot(selfId, currentTerm, role, votedFor, leaderId,
-                raftLog.lastIndex(), raftLog.lastTerm());
+                raftLog.lastIndex(), raftLog.lastTerm(), commitIndex);
     }
 
     public String selfId() {
@@ -166,5 +188,5 @@ public class RaftState {
     }
 
     public record Snapshot(String nodeId, long term, Role role, String votedFor, String leaderId,
-                           long lastLogIndex, long lastLogTerm) {}
+                           long lastLogIndex, long lastLogTerm, long commitIndex) {}
 }
