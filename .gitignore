@@ -1,0 +1,14 @@
+# Build output
+target/
+
+# Runtime logs and pid files
+logs/
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# OS junk
+.DS_Store
+Thumbs.db

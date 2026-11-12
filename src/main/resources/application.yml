@@ -1,0 +1,14 @@
+server:
+  port: ${SERVER_PORT:8081}
+
+raft:
+  node-id: ${RAFT_NODE_ID:node1}
+  peers: ${RAFT_PEERS:node1@http://localhost:8081,node2@http://localhost:8082,node3@http://localhost:8083,node4@http://localhost:8084,node5@http://localhost:8085}
+  election-timeout-min-ms: 150
+  election-timeout-max-ms: 300
+  heartbeat-interval-ms: 50
+  rpc-timeout-ms: 100
+
+logging:
+  pattern:
+    console: "%d{HH:mm:ss.SSS} [${RAFT_NODE_ID:node1}] %-5level %logger{20} - %msg%n"
