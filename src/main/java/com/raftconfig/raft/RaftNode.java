@@ -1,5 +1,7 @@
 package com.raftconfig.raft;
 
+import com.raftconfig.raft.rpc.AppendEntriesRequest;
+import com.raftconfig.raft.rpc.AppendEntriesResponse;
 import com.raftconfig.raft.rpc.RequestVoteRequest;
 import com.raftconfig.raft.rpc.RequestVoteResponse;
 import org.slf4j.Logger;
@@ -15,7 +17,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Drives Raft: timers, elections, and (soon) heartbeats and replication.
+ * Drives Raft: timers, elections, heartbeats (and soon replication).
  * RaftState holds the data; RaftNode decides when things happen.
  */
 public class RaftNode {
@@ -28,21 +30,25 @@ public class RaftNode {
     private final int quorum;
     private final long electionTimeoutMinMs;
     private final long electionTimeoutMaxMs;
+    private final long heartbeatIntervalMs;
 
     // One thread for timers; virtual threads for RPCs (cheap to block on HTTP)
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService rpcPool = Executors.newVirtualThreadPerTaskExecutor();
 
     private ScheduledFuture<?> electionTimer;
+    private ScheduledFuture<?> heartbeatTask;
+    private long heartbeatTerm = -1;   // which term the running heartbeat task belongs to
 
     public RaftNode(RaftState state, RaftTransport transport, List<String> peerIds, int quorum,
-                    long electionTimeoutMinMs, long electionTimeoutMaxMs) {
+                    long electionTimeoutMinMs, long electionTimeoutMaxMs, long heartbeatIntervalMs) {
         this.state = state;
         this.transport = transport;
         this.peerIds = List.copyOf(peerIds);
         this.quorum = quorum;
         this.electionTimeoutMinMs = electionTimeoutMinMs;
         this.electionTimeoutMaxMs = electionTimeoutMaxMs;
+        this.heartbeatIntervalMs = heartbeatIntervalMs;
     }
 
     public void start() {
@@ -87,7 +93,7 @@ public class RaftNode {
 
         AtomicInteger votes = new AtomicInteger(1); // we voted for ourselves
         if (votes.get() >= quorum) {                // single-node cluster
-            state.becomeLeader(term);
+            if (state.becomeLeader(term)) onBecameLeader(term);
             return;
         }
 
@@ -104,9 +110,51 @@ public class RaftNode {
             }
             // == (not >=) so only the vote that reaches quorum triggers the promotion
             if (resp.voteGranted() && votes.incrementAndGet() == quorum) {
-                state.becomeLeader(req.term());
+                if (state.becomeLeader(req.term())) {
+                    onBecameLeader(req.term());
+                }
             }
         });
+    }
+
+    // ---------- Leader: heartbeats ----------
+
+    private synchronized void onBecameLeader(long term) {
+        log.info("Won election for term {}, sending heartbeats every {} ms", term, heartbeatIntervalMs);
+        if (heartbeatTask != null) {
+            heartbeatTask.cancel(false);
+        }
+        heartbeatTerm = term;
+        // Initial delay 0: announce leadership immediately so no one else times out
+        heartbeatTask = scheduler.scheduleAtFixedRate(
+                () -> heartbeatTick(term), 0, heartbeatIntervalMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void heartbeatTick(long term) {
+        RaftState.Snapshot s = state.snapshot();
+        if (s.role() != Role.LEADER || s.term() != term) {
+            stopHeartbeats(term);
+            return;
+        }
+        AppendEntriesRequest req = new AppendEntriesRequest(
+                term, state.selfId(), state.lastLogIndex(), state.lastLogTerm(), List.of(), 0);
+        for (String peer : peerIds) {
+            rpcPool.submit(() -> sendHeartbeat(peer, req));
+        }
+    }
+
+    private void sendHeartbeat(String peer, AppendEntriesRequest req) {
+        // If a follower is in a higher term, we're a stale leader: step down
+        transport.appendEntries(peer, req).ifPresent(resp -> state.stepDownIfNewerTerm(resp.term()));
+    }
+
+    /** Only cancels the task if it still belongs to the given term (avoids killing a newer one). */
+    private synchronized void stopHeartbeats(long term) {
+        if (heartbeatTask != null && heartbeatTerm == term) {
+            heartbeatTask.cancel(false);
+            heartbeatTask = null;
+            log.info("No longer leader of term {}, stopped heartbeats", term);
+        }
     }
 
     // ---------- Incoming RPCs ----------
@@ -115,6 +163,16 @@ public class RaftNode {
         RequestVoteResponse resp = state.handleRequestVote(req);
         if (resp.voteGranted()) {
             // Granting a vote counts as hearing from a live candidate: don't start our own election
+            resetElectionTimer();
+        }
+        return resp;
+    }
+
+    public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
+        AppendEntriesResponse resp = state.handleAppendEntries(req);
+        // If the sender's term matches ours, it's the legitimate current leader:
+        // reset the timer. (In Phase 2 this holds even when the log check fails.)
+        if (req.term() == resp.term()) {
             resetElectionTimer();
         }
         return resp;
