@@ -7,7 +7,11 @@ import com.raftconfig.raft.rpc.RequestVoteResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeMap;
 
 /**
  * Core Raft state for one node (Figure 2 of the Raft paper).
@@ -18,6 +22,7 @@ import java.util.List;
 public class RaftState {
 
     private static final Logger log = LoggerFactory.getLogger(RaftState.class);
+    private static final int MAX_ENTRIES_PER_RPC = 100;
 
     private final String selfId;
 
@@ -29,7 +34,11 @@ public class RaftState {
     // Volatile state
     private Role role = Role.FOLLOWER;
     private String leaderId = null;
-    private long commitIndex = 0;   // highest log index known to be committed
+    private long commitIndex = 0;
+
+    // Leader-only state, reset on every election win
+    private final Map<String, Long> nextIndex = new HashMap<>();
+    private final Map<String, Long> matchIndex = new HashMap<>();
 
     public RaftState(String selfId) {
         this.selfId = selfId;
@@ -43,7 +52,7 @@ public class RaftState {
         }
         if (term > currentTerm) {
             currentTerm = term;
-            votedFor = null;   // new term, fresh vote
+            votedFor = null;
         }
         if (role != Role.FOLLOWER) {
             log.info("term={} {} -> FOLLOWER (leader={})", currentTerm, role, newLeaderId);
@@ -69,7 +78,10 @@ public class RaftState {
         }
         role = Role.LEADER;
         leaderId = selfId;
-        log.info("term={} -> LEADER", currentTerm);
+        // Fresh leader state: assume followers are up to date until proven otherwise
+        nextIndex.clear();
+        matchIndex.clear();
+        log.info("term={} -> LEADER (lastLogIndex={})", currentTerm, raftLog.lastIndex());
         return true;
     }
 
@@ -106,7 +118,6 @@ public class RaftState {
         return new RequestVoteResponse(currentTerm, false);
     }
 
-    /** "At least as up-to-date" (section 5.4.1): higher last term wins; equal terms -> longer log wins. */
     private boolean isCandidateLogUpToDate(long candLastIndex, long candLastTerm) {
         long myLastTerm = raftLog.lastTerm();
         long myLastIndex = raftLog.lastIndex();
@@ -116,10 +127,9 @@ public class RaftState {
         return candLastIndex >= myLastIndex;
     }
 
-    // ---------- AppendEntries (follower side) ----------
+    // ---------- AppendEntries: follower side ----------
 
     public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
-        // Rule 1: reject a stale leader
         if (req.term() < currentTerm) {
             log.debug("term={} reject AppendEntries from stale leader {} (term {})",
                     currentTerm, req.leaderId(), req.term());
@@ -127,14 +137,12 @@ public class RaftState {
         }
         becomeFollower(req.term(), req.leaderId());
 
-        // Rule 2: consistency check - we must have the entry just before the new ones
         if (raftLog.termAt(req.prevLogIndex()) != req.prevLogTerm()) {
             log.debug("term={} log mismatch at prevLogIndex={} (want term {}, have {})",
                     currentTerm, req.prevLogIndex(), req.prevLogTerm(), raftLog.termAt(req.prevLogIndex()));
             return new AppendEntriesResponse(currentTerm, false);
         }
 
-        // Rules 3 + 4: delete conflicting entries, append missing ones, skip ones we already have
         for (LogEntry entry : req.entries()) {
             long existingTerm = raftLog.termAt(entry.index());
             if (existingTerm == -1) {
@@ -145,10 +153,8 @@ public class RaftState {
                 raftLog.truncateFrom(entry.index());
                 raftLog.appendReplicated(entry);
             }
-            // else: identical entry already present (duplicate or retried RPC) -> skip
         }
 
-        // Rule 5: advance commitIndex, but never past what this RPC proved we have
         long lastNewIndex = req.prevLogIndex() + req.entries().size();
         if (req.leaderCommit() > commitIndex) {
             commitIndex = Math.min(req.leaderCommit(), lastNewIndex);
@@ -157,9 +163,75 @@ public class RaftState {
         return new AppendEntriesResponse(currentTerm, true);
     }
 
+    // ---------- AppendEntries: leader side ----------
+
+    /**
+     * Build the next AppendEntries for a follower, based on its nextIndex.
+     * Returns null if we're no longer leader.
+     */
+    public synchronized AppendEntriesRequest buildAppendEntries(String peer) {
+        if (role != Role.LEADER) {
+            return null;
+        }
+        long next = nextIndex.computeIfAbsent(peer, p -> raftLog.lastIndex() + 1);
+        long prevIndex = next - 1;
+        List<LogEntry> entries = raftLog.entriesFrom(next);
+        if (entries.size() > MAX_ENTRIES_PER_RPC) {
+            entries = entries.subList(0, MAX_ENTRIES_PER_RPC);
+        }
+        return new AppendEntriesRequest(currentTerm, selfId, prevIndex, raftLog.termAt(prevIndex),
+                entries, commitIndex);
+    }
+
+    /** Process a follower's reply to an AppendEntries we sent. */
+    public synchronized void handleAppendEntriesResponse(String peer, AppendEntriesRequest req,
+                                                         AppendEntriesResponse resp) {
+        if (resp.term() > currentTerm) {
+            becomeFollower(resp.term(), null);   // we're a stale leader
+            return;
+        }
+        // Ignore replies from an older term or after we stopped being leader
+        if (role != Role.LEADER || req.term() != currentTerm) {
+            return;
+        }
+
+        if (resp.success()) {
+            long match = req.prevLogIndex() + req.entries().size();
+            if (match > matchIndex.getOrDefault(peer, 0L)) {
+                matchIndex.put(peer, match);
+                if (!req.entries().isEmpty()) {
+                    log.info("term={} {} replicated up to index {}", currentTerm, peer, match);
+                }
+            }
+            // max(): a late, older success must not move nextIndex backwards
+            nextIndex.put(peer, Math.max(nextIndex.getOrDefault(peer, 1L), match + 1));
+        } else {
+            // Log mismatch: back up one entry and retry on the next tick.
+            // min(): a late, older failure must not move nextIndex forwards.
+            long backedUp = Math.max(1, Math.min(nextIndex.getOrDefault(peer, 1L), req.prevLogIndex()));
+            log.info("term={} {} rejected prevLogIndex={}, backing up nextIndex to {}",
+                    currentTerm, peer, req.prevLogIndex(), backedUp);
+            nextIndex.put(peer, backedUp);
+        }
+    }
+
+    /** Leader's view of each follower, for /status. Empty if not leader. */
+    public synchronized Map<String, Map<String, Long>> replicationProgress() {
+        if (role != Role.LEADER) {
+            return Map.of();
+        }
+        Map<String, Map<String, Long>> out = new TreeMap<>();
+        for (String peer : nextIndex.keySet()) {
+            Map<String, Long> p = new LinkedHashMap<>();
+            p.put("nextIndex", nextIndex.get(peer));
+            p.put("matchIndex", matchIndex.getOrDefault(peer, 0L));
+            out.put(peer, p);
+        }
+        return out;
+    }
+
     // ---------- Log ----------
 
-    /** Leader only: append a new command in the current term. Returns null if not leader. */
     public synchronized LogEntry appendAsLeader(String command) {
         if (role != Role.LEADER) {
             return null;

@@ -33,6 +33,10 @@ public class StatusController {
         out.put("commitIndex", s.commitIndex());
         out.put("clusterSize", props.clusterSize());
         out.put("quorum", props.quorum());
+        Map<String, Map<String, Long>> progress = state.replicationProgress();
+        if (!progress.isEmpty()) {
+            out.put("replication", progress);
+        }
         return out;
     }
 }
