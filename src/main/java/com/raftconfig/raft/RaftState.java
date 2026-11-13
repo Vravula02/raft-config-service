@@ -23,8 +23,11 @@ public class RaftState {
 
     private static final Logger log = LoggerFactory.getLogger(RaftState.class);
     private static final int MAX_ENTRIES_PER_RPC = 100;
+    public static final String NOOP = "NOOP";
 
     private final String selfId;
+    private final int quorum;
+    private final StateMachine stateMachine;
 
     // Persistent state (saved to disk in Phase 3)
     private long currentTerm = 0;
@@ -34,14 +37,17 @@ public class RaftState {
     // Volatile state
     private Role role = Role.FOLLOWER;
     private String leaderId = null;
-    private long commitIndex = 0;
+    private long commitIndex = 0;   // highest index known to be committed
+    private long lastApplied = 0;   // highest index applied to the state machine
 
     // Leader-only state, reset on every election win
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
 
-    public RaftState(String selfId) {
+    public RaftState(String selfId, int quorum, StateMachine stateMachine) {
         this.selfId = selfId;
+        this.quorum = quorum;
+        this.stateMachine = stateMachine;
     }
 
     // ---------- Role transitions ----------
@@ -78,10 +84,12 @@ public class RaftState {
         }
         role = Role.LEADER;
         leaderId = selfId;
-        // Fresh leader state: assume followers are up to date until proven otherwise
         nextIndex.clear();
         matchIndex.clear();
-        log.info("term={} -> LEADER (lastLogIndex={})", currentTerm, raftLog.lastIndex());
+        // No-op in our own term: once it commits, every earlier entry is committed too (section 8)
+        LogEntry noop = raftLog.append(currentTerm, NOOP);
+        log.info("term={} -> LEADER (appended NOOP at index {})", currentTerm, noop.index());
+        advanceLeaderCommit();   // only matters for a single-node cluster
         return true;
     }
 
@@ -155,9 +163,12 @@ public class RaftState {
             }
         }
 
+        // Advance commitIndex, never past what this RPC proved we have, and never backwards
         long lastNewIndex = req.prevLogIndex() + req.entries().size();
-        if (req.leaderCommit() > commitIndex) {
-            commitIndex = Math.min(req.leaderCommit(), lastNewIndex);
+        long newCommit = Math.min(req.leaderCommit(), lastNewIndex);
+        if (newCommit > commitIndex) {
+            commitIndex = newCommit;
+            applyCommitted();
         }
 
         return new AppendEntriesResponse(currentTerm, true);
@@ -165,10 +176,6 @@ public class RaftState {
 
     // ---------- AppendEntries: leader side ----------
 
-    /**
-     * Build the next AppendEntries for a follower, based on its nextIndex.
-     * Returns null if we're no longer leader.
-     */
     public synchronized AppendEntriesRequest buildAppendEntries(String peer) {
         if (role != Role.LEADER) {
             return null;
@@ -183,14 +190,12 @@ public class RaftState {
                 entries, commitIndex);
     }
 
-    /** Process a follower's reply to an AppendEntries we sent. */
     public synchronized void handleAppendEntriesResponse(String peer, AppendEntriesRequest req,
                                                          AppendEntriesResponse resp) {
         if (resp.term() > currentTerm) {
-            becomeFollower(resp.term(), null);   // we're a stale leader
+            becomeFollower(resp.term(), null);
             return;
         }
-        // Ignore replies from an older term or after we stopped being leader
         if (role != Role.LEADER || req.term() != currentTerm) {
             return;
         }
@@ -202,12 +207,10 @@ public class RaftState {
                 if (!req.entries().isEmpty()) {
                     log.info("term={} {} replicated up to index {}", currentTerm, peer, match);
                 }
+                advanceLeaderCommit();
             }
-            // max(): a late, older success must not move nextIndex backwards
             nextIndex.put(peer, Math.max(nextIndex.getOrDefault(peer, 1L), match + 1));
         } else {
-            // Log mismatch: back up one entry and retry on the next tick.
-            // min(): a late, older failure must not move nextIndex forwards.
             long backedUp = Math.max(1, Math.min(nextIndex.getOrDefault(peer, 1L), req.prevLogIndex()));
             log.info("term={} {} rejected prevLogIndex={}, backing up nextIndex to {}",
                     currentTerm, peer, req.prevLogIndex(), backedUp);
@@ -215,7 +218,38 @@ public class RaftState {
         }
     }
 
-    /** Leader's view of each follower, for /status. Empty if not leader. */
+    /**
+     * Leader: find the highest index N stored on a majority and commit it.
+     * Only entries from the CURRENT term are counted directly (Figure 8);
+     * earlier entries commit along with them.
+     */
+    private void advanceLeaderCommit() {
+        for (long n = raftLog.lastIndex(); n > commitIndex; n--) {
+            if (raftLog.termAt(n) != currentTerm) {
+                break;   // terms only decrease going backwards, so nothing below qualifies either
+            }
+            int replicas = 1;   // ourselves
+            for (long m : matchIndex.values()) {
+                if (m >= n) replicas++;
+            }
+            if (replicas >= quorum) {
+                log.info("term={} committed up to index {} ({} of {} replicas)",
+                        currentTerm, n, replicas, quorum);
+                commitIndex = n;
+                applyCommitted();
+                return;
+            }
+        }
+    }
+
+    /** Apply every committed-but-not-yet-applied entry, in order. */
+    private void applyCommitted() {
+        while (lastApplied < commitIndex) {
+            lastApplied++;
+            stateMachine.apply(raftLog.get(lastApplied));
+        }
+    }
+
     public synchronized Map<String, Map<String, Long>> replicationProgress() {
         if (role != Role.LEADER) {
             return Map.of();
@@ -238,6 +272,7 @@ public class RaftState {
         }
         LogEntry entry = raftLog.append(currentTerm, command);
         log.info("term={} appended index={} command={}", currentTerm, entry.index(), command);
+        advanceLeaderCommit();   // only matters for a single-node cluster
         return entry;
     }
 
@@ -252,7 +287,7 @@ public class RaftState {
 
     public synchronized Snapshot snapshot() {
         return new Snapshot(selfId, currentTerm, role, votedFor, leaderId,
-                raftLog.lastIndex(), raftLog.lastTerm(), commitIndex);
+                raftLog.lastIndex(), raftLog.lastTerm(), commitIndex, lastApplied);
     }
 
     public String selfId() {
@@ -260,5 +295,5 @@ public class RaftState {
     }
 
     public record Snapshot(String nodeId, long term, Role role, String votedFor, String leaderId,
-                           long lastLogIndex, long lastLogTerm, long commitIndex) {}
+                           long lastLogIndex, long lastLogTerm, long commitIndex, long lastApplied) {}
 }

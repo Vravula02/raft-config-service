@@ -3,6 +3,7 @@ package com.raftconfig.config;
 import com.raftconfig.raft.RaftNode;
 import com.raftconfig.raft.RaftState;
 import com.raftconfig.raft.RaftTransport;
+import com.raftconfig.store.KeyValueStore;
 import com.raftconfig.transport.HttpRaftTransport;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationListener;
@@ -16,8 +17,13 @@ import java.util.ArrayList;
 public class RaftConfiguration {
 
     @Bean
-    public RaftState raftState(NodeProperties props) {
-        return new RaftState(props.nodeId());
+    public KeyValueStore keyValueStore() {
+        return new KeyValueStore();
+    }
+
+    @Bean
+    public RaftState raftState(NodeProperties props, KeyValueStore store) {
+        return new RaftState(props.nodeId(), props.quorum(), store);
     }
 
     @Bean
@@ -39,11 +45,7 @@ public class RaftConfiguration {
         );
     }
 
-    /**
-     * Start Raft only once the web server is up and accepting requests.
-     * Otherwise a restarting node times out before it can hear the current
-     * leader's heartbeats, and disrupts a healthy cluster.
-     */
+    /** Start Raft only once the web server is accepting requests. */
     @Bean
     public ApplicationListener<ApplicationReadyEvent> startRaftWhenReady(RaftNode node) {
         return event -> node.start();
