@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -20,7 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Drives Raft: timers, elections, heartbeats and replication.
+ * Drives Raft: timers, elections, heartbeats, replication, and client writes.
  * RaftState holds the data; RaftNode decides when things happen.
  */
 public class RaftNode {
@@ -67,6 +68,21 @@ public class RaftNode {
     public void stop() {
         scheduler.shutdownNow();
         rpcPool.shutdownNow();
+    }
+
+    // ---------- Client writes ----------
+
+    /**
+     * Submit a client command. The future completes with the log index once the
+     * command is committed and applied, or fails with NotLeaderException /
+     * LeadershipLostException.
+     */
+    public CompletableFuture<Long> submit(String command) {
+        CompletableFuture<Long> future = state.submit(command);
+        if (!future.isDone()) {
+            replicateNow();   // don't wait up to one heartbeat interval
+        }
+        return future;
     }
 
     // ---------- Election timer ----------
@@ -138,20 +154,31 @@ public class RaftNode {
             stopHeartbeats(term);
             return;
         }
+        sendToAllPeers(term);
+    }
+
+    /** Push new entries to followers right now, outside the heartbeat schedule. */
+    private void replicateNow() {
+        RaftState.Snapshot s = state.snapshot();
+        if (s.role() == Role.LEADER) {
+            sendToAllPeers(s.term());
+        }
+    }
+
+    private void sendToAllPeers(long term) {
         for (String peer : peerIds) {
-            // Skip this follower if its previous RPC hasn't come back yet
+            // Skip a follower whose previous RPC hasn't come back yet
             if (inFlight.get(peer).compareAndSet(false, true)) {
                 rpcPool.submit(() -> replicateTo(peer, term));
             }
         }
     }
 
-    /** Send one AppendEntries (heartbeat or entries) to a follower and process the reply. */
     private void replicateTo(String peer, long term) {
         try {
             AppendEntriesRequest req = state.buildAppendEntries(peer);
             if (req == null || req.term() != term) {
-                return;   // no longer leader of this term
+                return;
             }
             transport.appendEntries(peer, req)
                     .ifPresent(resp -> state.handleAppendEntriesResponse(peer, req, resp));
@@ -180,7 +207,6 @@ public class RaftNode {
 
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {
         AppendEntriesResponse resp = state.handleAppendEntries(req);
-        // Current leader (even if the log check failed): reset the timer
         if (req.term() == resp.term()) {
             resetElectionTimer();
         }
