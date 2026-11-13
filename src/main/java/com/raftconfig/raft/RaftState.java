@@ -12,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Core Raft state for one node (Figure 2 of the Raft paper).
@@ -45,6 +46,10 @@ public class RaftState {
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
 
+    // Leader-only: client writes waiting for their entry to be applied, by log index
+    private record PendingWrite(long term, CompletableFuture<Long> future) {}
+    private final Map<Long, PendingWrite> pending = new HashMap<>();
+
     public RaftState(String selfId, int quorum, StateMachine stateMachine,
                      MetadataStore metadata, RaftLog raftLog) {
         this.selfId = selfId;
@@ -69,6 +74,9 @@ public class RaftState {
             currentTerm = term;
             votedFor = null;
             persistMetadata();
+        }
+        if (role == Role.LEADER) {
+            failPendingWrites(newLeaderId);
         }
         if (role != Role.FOLLOWER) {
             log.info("term={} {} -> FOLLOWER (leader={})", currentTerm, role, newLeaderId);
@@ -109,6 +117,34 @@ public class RaftState {
             return true;
         }
         return false;
+    }
+
+    // ---------- Client writes ----------
+
+    /**
+     * Leader: append a client command and return a future that completes with its
+     * log index once it's committed AND applied. Fails fast if we're not the leader.
+     */
+    public synchronized CompletableFuture<Long> submit(String command) {
+        if (role != Role.LEADER) {
+            return CompletableFuture.failedFuture(new NotLeaderException(leaderId));
+        }
+        LogEntry entry = raftLog.append(currentTerm, command);
+        log.info("term={} client write at index={} command={}", currentTerm, entry.index(), command);
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        pending.put(entry.index(), new PendingWrite(entry.term(), future));
+        advanceLeaderCommit();   // only commits right away in a single-node cluster
+        return future;
+    }
+
+    /** We stopped being leader: tell every waiting client the outcome is unknown. */
+    private void failPendingWrites(String newLeaderId) {
+        if (pending.isEmpty()) return;
+        log.info("term={} no longer leader, failing {} pending writes", currentTerm, pending.size());
+        for (PendingWrite w : pending.values()) {
+            w.future().completeExceptionally(new LeadershipLostException(newLeaderId));
+        }
+        pending.clear();
     }
 
     // ---------- RequestVote ----------
@@ -164,14 +200,12 @@ public class RaftState {
             return new AppendEntriesResponse(currentTerm, false);
         }
 
-        // Skip entries we already have; at the first missing or conflicting one,
-        // drop any conflicting suffix and append the rest with a single fsync.
         List<LogEntry> incoming = req.entries();
         for (int i = 0; i < incoming.size(); i++) {
             LogEntry entry = incoming.get(i);
             long existingTerm = raftLog.termAt(entry.index());
             if (existingTerm == entry.term()) {
-                continue;   // already have it (duplicate or retried RPC)
+                continue;
             }
             if (existingTerm != -1) {
                 log.info("term={} conflict at index {} (have term {}, leader has {}), truncating",
@@ -189,7 +223,6 @@ public class RaftState {
             applyCommitted();
         }
 
-        // Entries are on disk at this point, so it's safe to say "success"
         return new AppendEntriesResponse(currentTerm, true);
     }
 
@@ -243,7 +276,7 @@ public class RaftState {
             if (raftLog.termAt(n) != currentTerm) {
                 break;
             }
-            int replicas = 1;   // ourselves: our copy is already fsynced
+            int replicas = 1;
             for (long m : matchIndex.values()) {
                 if (m >= n) replicas++;
             }
@@ -257,10 +290,21 @@ public class RaftState {
         }
     }
 
+    /** Apply committed entries in order, and answer any client waiting on them. */
     private void applyCommitted() {
         while (lastApplied < commitIndex) {
             lastApplied++;
-            stateMachine.apply(raftLog.get(lastApplied));
+            LogEntry entry = raftLog.get(lastApplied);
+            stateMachine.apply(entry);
+            PendingWrite w = pending.remove(lastApplied);
+            if (w != null) {
+                if (w.term() == entry.term()) {
+                    w.future().complete(entry.index());
+                } else {
+                    // A different entry was committed at this index: ours was overwritten
+                    w.future().completeExceptionally(new LeadershipLostException(leaderId));
+                }
+            }
         }
     }
 
@@ -280,6 +324,7 @@ public class RaftState {
 
     // ---------- Log ----------
 
+    /** Used by the temporary /debug/append endpoint only (removed in Step 3). */
     public synchronized LogEntry appendAsLeader(String command) {
         if (role != Role.LEADER) {
             return null;
