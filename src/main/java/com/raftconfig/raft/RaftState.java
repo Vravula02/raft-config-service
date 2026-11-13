@@ -28,26 +28,32 @@ public class RaftState {
     private final String selfId;
     private final int quorum;
     private final StateMachine stateMachine;
+    private final MetadataStore metadata;
 
-    // Persistent state (saved to disk in Phase 3)
-    private long currentTerm = 0;
-    private String votedFor = null;
-    private final RaftLog raftLog = new RaftLog();
+    // Persistent state: term and vote are saved to disk before we reply to anyone
+    private long currentTerm;
+    private String votedFor;
+    private final RaftLog raftLog = new RaftLog();   // persisted in Phase 3, Step 2
 
     // Volatile state
     private Role role = Role.FOLLOWER;
     private String leaderId = null;
-    private long commitIndex = 0;   // highest index known to be committed
-    private long lastApplied = 0;   // highest index applied to the state machine
+    private long commitIndex = 0;
+    private long lastApplied = 0;
 
     // Leader-only state, reset on every election win
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
 
-    public RaftState(String selfId, int quorum, StateMachine stateMachine) {
+    public RaftState(String selfId, int quorum, StateMachine stateMachine, MetadataStore metadata) {
         this.selfId = selfId;
         this.quorum = quorum;
         this.stateMachine = stateMachine;
+        this.metadata = metadata;
+        MetadataStore.Metadata saved = metadata.load();
+        this.currentTerm = saved.currentTerm();
+        this.votedFor = saved.votedFor();
+        log.info("Loaded persisted state: term={} votedFor={}", currentTerm, votedFor);
     }
 
     // ---------- Role transitions ----------
@@ -59,6 +65,7 @@ public class RaftState {
         if (term > currentTerm) {
             currentTerm = term;
             votedFor = null;
+            persistMetadata();
         }
         if (role != Role.FOLLOWER) {
             log.info("term={} {} -> FOLLOWER (leader={})", currentTerm, role, newLeaderId);
@@ -72,6 +79,7 @@ public class RaftState {
     public synchronized long becomeCandidate() {
         currentTerm++;
         votedFor = selfId;
+        persistMetadata();   // must be on disk before we ask anyone for votes
         role = Role.CANDIDATE;
         leaderId = null;
         log.info("term={} -> CANDIDATE", currentTerm);
@@ -86,10 +94,9 @@ public class RaftState {
         leaderId = selfId;
         nextIndex.clear();
         matchIndex.clear();
-        // No-op in our own term: once it commits, every earlier entry is committed too (section 8)
         LogEntry noop = raftLog.append(currentTerm, NOOP);
         log.info("term={} -> LEADER (appended NOOP at index {})", currentTerm, noop.index());
-        advanceLeaderCommit();   // only matters for a single-node cluster
+        advanceLeaderCommit();
         return true;
     }
 
@@ -116,7 +123,10 @@ public class RaftState {
         boolean logOk = isCandidateLogUpToDate(req.lastLogIndex(), req.lastLogTerm());
 
         if (canVote && logOk) {
-            votedFor = req.candidateId();
+            if (!req.candidateId().equals(votedFor)) {
+                votedFor = req.candidateId();
+                persistMetadata();   // vote is on disk before the "yes" leaves this node
+            }
             log.info("term={} voted for {}", currentTerm, req.candidateId());
             return new RequestVoteResponse(currentTerm, true);
         }
@@ -163,7 +173,6 @@ public class RaftState {
             }
         }
 
-        // Advance commitIndex, never past what this RPC proved we have, and never backwards
         long lastNewIndex = req.prevLogIndex() + req.entries().size();
         long newCommit = Math.min(req.leaderCommit(), lastNewIndex);
         if (newCommit > commitIndex) {
@@ -218,17 +227,13 @@ public class RaftState {
         }
     }
 
-    /**
-     * Leader: find the highest index N stored on a majority and commit it.
-     * Only entries from the CURRENT term are counted directly (Figure 8);
-     * earlier entries commit along with them.
-     */
+    /** Leader: commit the highest current-term index stored on a majority (Figure 8). */
     private void advanceLeaderCommit() {
         for (long n = raftLog.lastIndex(); n > commitIndex; n--) {
             if (raftLog.termAt(n) != currentTerm) {
-                break;   // terms only decrease going backwards, so nothing below qualifies either
+                break;
             }
-            int replicas = 1;   // ourselves
+            int replicas = 1;
             for (long m : matchIndex.values()) {
                 if (m >= n) replicas++;
             }
@@ -242,7 +247,6 @@ public class RaftState {
         }
     }
 
-    /** Apply every committed-but-not-yet-applied entry, in order. */
     private void applyCommitted() {
         while (lastApplied < commitIndex) {
             lastApplied++;
@@ -272,7 +276,7 @@ public class RaftState {
         }
         LogEntry entry = raftLog.append(currentTerm, command);
         log.info("term={} appended index={} command={}", currentTerm, entry.index(), command);
-        advanceLeaderCommit();   // only matters for a single-node cluster
+        advanceLeaderCommit();
         return entry;
     }
 
@@ -281,6 +285,13 @@ public class RaftState {
 
     public synchronized List<LogEntry> logEntries() {
         return raftLog.all();
+    }
+
+    // ---------- Persistence ----------
+
+    /** Called with the lock held, before we reply to anyone. */
+    private void persistMetadata() {
+        metadata.save(currentTerm, votedFor);
     }
 
     // ---------- Reading state ----------

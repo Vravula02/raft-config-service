@@ -7,7 +7,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
- * Identity of this node, its peers, and Raft timing settings.
+ * Identity of this node, its peers, Raft timing, and where it stores data.
  * peers format: node2@http://localhost:8082,node3@http://localhost:8083
  */
 @ConfigurationProperties(prefix = "raft")
@@ -17,7 +17,8 @@ public record NodeProperties(
         long electionTimeoutMinMs,
         long electionTimeoutMaxMs,
         long heartbeatIntervalMs,
-        long rpcTimeoutMs
+        long rpcTimeoutMs,
+        String dataDir
 ) {
 
     public NodeProperties {
@@ -31,9 +32,11 @@ public record NodeProperties(
         if (heartbeatIntervalMs <= 0 || heartbeatIntervalMs >= electionTimeoutMinMs) {
             throw new IllegalArgumentException("heartbeat interval must be > 0 and < election timeout min");
         }
+        if (dataDir == null || dataDir.isBlank()) {
+            dataDir = "data/" + nodeId;
+        }
     }
 
-    /** Peer id -> base URL, excluding this node. */
     public Map<String, String> peerMap() {
         Map<String, String> map = new LinkedHashMap<>();
         for (String entry : peers.split(",")) {
