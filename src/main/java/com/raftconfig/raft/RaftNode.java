@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -21,12 +22,14 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Drives Raft: timers, elections, heartbeats, replication, and client writes.
+ * Drives Raft: timers, elections, heartbeats, replication, client writes and reads.
  * RaftState holds the data; RaftNode decides when things happen.
  */
 public class RaftNode {
 
     private static final Logger log = LoggerFactory.getLogger(RaftNode.class);
+
+    public enum ReadResult { OK, LEADER_NOT_READY, NO_QUORUM, TIMEOUT }
 
     private final RaftState state;
     private final RaftTransport transport;
@@ -39,7 +42,6 @@ public class RaftNode {
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final ExecutorService rpcPool = Executors.newVirtualThreadPerTaskExecutor();
 
-    // At most one AppendEntries in flight per follower
     private final Map<String, AtomicBoolean> inFlight = new ConcurrentHashMap<>();
 
     private ScheduledFuture<?> electionTimer;
@@ -72,17 +74,65 @@ public class RaftNode {
 
     // ---------- Client writes ----------
 
-    /**
-     * Submit a client command. The future completes with the log index once the
-     * command is committed and applied, or fails with NotLeaderException /
-     * LeadershipLostException.
-     */
     public CompletableFuture<Long> submit(String command) {
         CompletableFuture<Long> future = state.submit(command);
         if (!future.isDone()) {
-            replicateNow();   // don't wait up to one heartbeat interval
+            replicateNow();
         }
         return future;
+    }
+
+    // ---------- Client reads (ReadIndex) ----------
+
+    /**
+     * Linearizable read barrier. When this returns OK, reading the local store
+     * reflects every write committed before the read started.
+     * Throws NotLeaderException on followers.
+     */
+    public ReadResult readBarrier(long timeoutMs) throws InterruptedException {
+        long readIndex = state.readIndex();          // 1. note the commit index
+        if (readIndex < 0) {
+            return ReadResult.LEADER_NOT_READY;      // our NOOP hasn't committed yet
+        }
+        if (!confirmLeadership(timeoutMs)) {        // 2. a majority still follows us
+            return ReadResult.NO_QUORUM;
+        }
+        if (!state.awaitApplied(readIndex, timeoutMs)) {   // 3. state machine has caught up
+            return ReadResult.TIMEOUT;
+        }
+        return ReadResult.OK;
+    }
+
+    /** One heartbeat round: true if a majority (counting us) answers in our current term. */
+    private boolean confirmLeadership(long timeoutMs) throws InterruptedException {
+        RaftState.Snapshot s = state.snapshot();
+        if (s.role() != Role.LEADER) {
+            return false;
+        }
+        long term = s.term();
+        int needed = quorum - 1;
+        if (needed <= 0) {
+            return true;   // single-node cluster
+        }
+        CountDownLatch acks = new CountDownLatch(needed);
+        for (String peer : peerIds) {
+            rpcPool.submit(() -> {
+                AppendEntriesRequest req = state.buildAppendEntries(peer);
+                if (req == null || req.term() != term) {
+                    return;
+                }
+                transport.appendEntries(peer, req).ifPresent(resp -> {
+                    state.handleAppendEntriesResponse(peer, req, resp);
+                    // Any reply in our term (even a log mismatch) proves it still follows us
+                    if (resp.term() == term) {
+                        acks.countDown();
+                    }
+                });
+            });
+        }
+        boolean gotMajority = acks.await(timeoutMs, TimeUnit.MILLISECONDS);
+        RaftState.Snapshot after = state.snapshot();
+        return gotMajority && after.role() == Role.LEADER && after.term() == term;
     }
 
     // ---------- Election timer ----------
@@ -157,7 +207,6 @@ public class RaftNode {
         sendToAllPeers(term);
     }
 
-    /** Push new entries to followers right now, outside the heartbeat schedule. */
     private void replicateNow() {
         RaftState.Snapshot s = state.snapshot();
         if (s.role() == Role.LEADER) {
@@ -167,7 +216,6 @@ public class RaftNode {
 
     private void sendToAllPeers(long term) {
         for (String peer : peerIds) {
-            // Skip a follower whose previous RPC hasn't come back yet
             if (inFlight.get(peer).compareAndSet(false, true)) {
                 rpcPool.submit(() -> replicateTo(peer, term));
             }

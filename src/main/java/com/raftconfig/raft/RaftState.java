@@ -121,10 +121,6 @@ public class RaftState {
 
     // ---------- Client writes ----------
 
-    /**
-     * Leader: append a client command and return a future that completes with its
-     * log index once it's committed AND applied. Fails fast if we're not the leader.
-     */
     public synchronized CompletableFuture<Long> submit(String command) {
         if (role != Role.LEADER) {
             return CompletableFuture.failedFuture(new NotLeaderException(leaderId));
@@ -133,11 +129,10 @@ public class RaftState {
         log.info("term={} client write at index={} command={}", currentTerm, entry.index(), command);
         CompletableFuture<Long> future = new CompletableFuture<>();
         pending.put(entry.index(), new PendingWrite(entry.term(), future));
-        advanceLeaderCommit();   // only commits right away in a single-node cluster
+        advanceLeaderCommit();
         return future;
     }
 
-    /** We stopped being leader: tell every waiting client the outcome is unknown. */
     private void failPendingWrites(String newLeaderId) {
         if (pending.isEmpty()) return;
         log.info("term={} no longer leader, failing {} pending writes", currentTerm, pending.size());
@@ -145,6 +140,37 @@ public class RaftState {
             w.future().completeExceptionally(new LeadershipLostException(newLeaderId));
         }
         pending.clear();
+    }
+
+    // ---------- Linearizable reads (ReadIndex, Raft thesis 6.4) ----------
+
+    /**
+     * Leader: the commit index a linearizable read must wait for.
+     * Returns -1 if we haven't committed an entry in our own term yet (our NOOP),
+     * because until then we don't know the latest commit index.
+     * Throws NotLeaderException on followers.
+     */
+    public synchronized long readIndex() {
+        if (role != Role.LEADER) {
+            throw new NotLeaderException(leaderId);
+        }
+        if (raftLog.termAt(commitIndex) != currentTerm) {
+            return -1;
+        }
+        return commitIndex;
+    }
+
+    /** Block until lastApplied >= index, or the timeout passes. Releases the lock while waiting. */
+    public synchronized boolean awaitApplied(long index, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (lastApplied < index) {
+            long left = deadline - System.currentTimeMillis();
+            if (left <= 0) {
+                return false;
+            }
+            wait(left);
+        }
+        return true;
     }
 
     // ---------- RequestVote ----------
@@ -270,7 +296,6 @@ public class RaftState {
         }
     }
 
-    /** Leader: commit the highest current-term index stored on a majority (Figure 8). */
     private void advanceLeaderCommit() {
         for (long n = raftLog.lastIndex(); n > commitIndex; n--) {
             if (raftLog.termAt(n) != currentTerm) {
@@ -290,10 +315,12 @@ public class RaftState {
         }
     }
 
-    /** Apply committed entries in order, and answer any client waiting on them. */
+    /** Apply committed entries in order, answer waiting writers, wake waiting readers. */
     private void applyCommitted() {
+        boolean appliedAny = false;
         while (lastApplied < commitIndex) {
             lastApplied++;
+            appliedAny = true;
             LogEntry entry = raftLog.get(lastApplied);
             stateMachine.apply(entry);
             PendingWrite w = pending.remove(lastApplied);
@@ -301,10 +328,12 @@ public class RaftState {
                 if (w.term() == entry.term()) {
                     w.future().complete(entry.index());
                 } else {
-                    // A different entry was committed at this index: ours was overwritten
                     w.future().completeExceptionally(new LeadershipLostException(leaderId));
                 }
             }
+        }
+        if (appliedAny) {
+            notifyAll();   // wake readers blocked in awaitApplied()
         }
     }
 
@@ -323,17 +352,6 @@ public class RaftState {
     }
 
     // ---------- Log ----------
-
-    /** Used by the temporary /debug/append endpoint only (removed in Step 3). */
-    public synchronized LogEntry appendAsLeader(String command) {
-        if (role != Role.LEADER) {
-            return null;
-        }
-        LogEntry entry = raftLog.append(currentTerm, command);
-        log.info("term={} appended index={} command={}", currentTerm, entry.index(), command);
-        advanceLeaderCommit();
-        return entry;
-    }
 
     public synchronized long lastLogIndex() { return raftLog.lastIndex(); }
     public synchronized long lastLogTerm()  { return raftLog.lastTerm(); }
