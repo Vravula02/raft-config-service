@@ -1,6 +1,7 @@
 package com.raftconfig.config;
 
 import com.raftconfig.raft.MetadataStore;
+import com.raftconfig.raft.RaftLog;
 import com.raftconfig.raft.RaftNode;
 import com.raftconfig.raft.RaftState;
 import com.raftconfig.raft.RaftTransport;
@@ -25,8 +26,9 @@ public class RaftConfiguration {
 
     @Bean
     public RaftState raftState(NodeProperties props, KeyValueStore store) {
-        MetadataStore metadata = new MetadataStore(Path.of(props.dataDir()));
-        return new RaftState(props.nodeId(), props.quorum(), store, metadata);
+        Path dir = Path.of(props.dataDir());
+        return new RaftState(props.nodeId(), props.quorum(), store,
+                new MetadataStore(dir), new RaftLog(dir));
     }
 
     @Bean

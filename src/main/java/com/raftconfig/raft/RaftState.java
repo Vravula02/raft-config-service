@@ -30,12 +30,12 @@ public class RaftState {
     private final StateMachine stateMachine;
     private final MetadataStore metadata;
 
-    // Persistent state: term and vote are saved to disk before we reply to anyone
+    // Persistent state: on disk before we reply to anyone
     private long currentTerm;
     private String votedFor;
-    private final RaftLog raftLog = new RaftLog();   // persisted in Phase 3, Step 2
+    private final RaftLog raftLog;
 
-    // Volatile state
+    // Volatile state (rebuilt after a restart)
     private Role role = Role.FOLLOWER;
     private String leaderId = null;
     private long commitIndex = 0;
@@ -45,15 +45,18 @@ public class RaftState {
     private final Map<String, Long> nextIndex = new HashMap<>();
     private final Map<String, Long> matchIndex = new HashMap<>();
 
-    public RaftState(String selfId, int quorum, StateMachine stateMachine, MetadataStore metadata) {
+    public RaftState(String selfId, int quorum, StateMachine stateMachine,
+                     MetadataStore metadata, RaftLog raftLog) {
         this.selfId = selfId;
         this.quorum = quorum;
         this.stateMachine = stateMachine;
         this.metadata = metadata;
+        this.raftLog = raftLog;
         MetadataStore.Metadata saved = metadata.load();
         this.currentTerm = saved.currentTerm();
         this.votedFor = saved.votedFor();
-        log.info("Loaded persisted state: term={} votedFor={}", currentTerm, votedFor);
+        log.info("Loaded persisted state: term={} votedFor={} lastLogIndex={}",
+                currentTerm, votedFor, raftLog.lastIndex());
     }
 
     // ---------- Role transitions ----------
@@ -79,7 +82,7 @@ public class RaftState {
     public synchronized long becomeCandidate() {
         currentTerm++;
         votedFor = selfId;
-        persistMetadata();   // must be on disk before we ask anyone for votes
+        persistMetadata();
         role = Role.CANDIDATE;
         leaderId = null;
         log.info("term={} -> CANDIDATE", currentTerm);
@@ -125,7 +128,7 @@ public class RaftState {
         if (canVote && logOk) {
             if (!req.candidateId().equals(votedFor)) {
                 votedFor = req.candidateId();
-                persistMetadata();   // vote is on disk before the "yes" leaves this node
+                persistMetadata();
             }
             log.info("term={} voted for {}", currentTerm, req.candidateId());
             return new RequestVoteResponse(currentTerm, true);
@@ -161,25 +164,32 @@ public class RaftState {
             return new AppendEntriesResponse(currentTerm, false);
         }
 
-        for (LogEntry entry : req.entries()) {
+        // Skip entries we already have; at the first missing or conflicting one,
+        // drop any conflicting suffix and append the rest with a single fsync.
+        List<LogEntry> incoming = req.entries();
+        for (int i = 0; i < incoming.size(); i++) {
+            LogEntry entry = incoming.get(i);
             long existingTerm = raftLog.termAt(entry.index());
-            if (existingTerm == -1) {
-                raftLog.appendReplicated(entry);
-            } else if (existingTerm != entry.term()) {
+            if (existingTerm == entry.term()) {
+                continue;   // already have it (duplicate or retried RPC)
+            }
+            if (existingTerm != -1) {
                 log.info("term={} conflict at index {} (have term {}, leader has {}), truncating",
                         currentTerm, entry.index(), existingTerm, entry.term());
                 raftLog.truncateFrom(entry.index());
-                raftLog.appendReplicated(entry);
             }
+            raftLog.appendAll(incoming.subList(i, incoming.size()));
+            break;
         }
 
-        long lastNewIndex = req.prevLogIndex() + req.entries().size();
+        long lastNewIndex = req.prevLogIndex() + incoming.size();
         long newCommit = Math.min(req.leaderCommit(), lastNewIndex);
         if (newCommit > commitIndex) {
             commitIndex = newCommit;
             applyCommitted();
         }
 
+        // Entries are on disk at this point, so it's safe to say "success"
         return new AppendEntriesResponse(currentTerm, true);
     }
 
@@ -233,7 +243,7 @@ public class RaftState {
             if (raftLog.termAt(n) != currentTerm) {
                 break;
             }
-            int replicas = 1;
+            int replicas = 1;   // ourselves: our copy is already fsynced
             for (long m : matchIndex.values()) {
                 if (m >= n) replicas++;
             }
@@ -289,7 +299,6 @@ public class RaftState {
 
     // ---------- Persistence ----------
 
-    /** Called with the lock held, before we reply to anyone. */
     private void persistMetadata() {
         metadata.save(currentTerm, votedFor);
     }
