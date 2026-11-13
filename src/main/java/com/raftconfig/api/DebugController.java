@@ -2,6 +2,7 @@ package com.raftconfig.api;
 
 import com.raftconfig.raft.LogEntry;
 import com.raftconfig.raft.RaftState;
+import com.raftconfig.store.KeyValueStore;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -16,9 +17,11 @@ import java.util.Map;
 public class DebugController {
 
     private final RaftState state;
+    private final KeyValueStore store;
 
-    public DebugController(RaftState state) {
+    public DebugController(RaftState state, KeyValueStore store) {
         this.state = state;
+        this.store = store;
     }
 
     @GetMapping("/log")
@@ -26,7 +29,11 @@ public class DebugController {
         return state.logEntries();
     }
 
-    /** Append a raw command on the leader. Followers answer 409 with a hint. */
+    @GetMapping("/debug/kv")
+    public Map<String, String> kv() {
+        return store.all();
+    }
+
     @PostMapping("/debug/append")
     public ResponseEntity<?> append(@RequestBody String command) {
         LogEntry entry = state.appendAsLeader(command);
