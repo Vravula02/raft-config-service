@@ -9,6 +9,7 @@ import com.raftconfig.store.KeyValueStore;
 import com.raftconfig.transport.HttpRaftTransport;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextClosedEvent;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -53,5 +54,15 @@ public class RaftConfiguration {
     @Bean
     public ApplicationListener<ApplicationReadyEvent> startRaftWhenReady(RaftNode node) {
         return event -> node.start();
+    }
+
+    /**
+     * Stop Raft as soon as shutdown begins (SIGTERM, e.g. kubectl delete pod), before the
+     * web server's graceful drain. Otherwise a terminating leader keeps sending heartbeats
+     * for up to the grace period, and followers wait instead of electing a new leader.
+     */
+    @Bean
+    public ApplicationListener<ContextClosedEvent> stopRaftOnShutdown(RaftNode node) {
+        return event -> node.stop();
     }
 }
