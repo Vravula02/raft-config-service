@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Fault-tolerance test. The cluster must already be running.
+# Fault-tolerance test. The cluster must already be running (local or docker compose).
 #   1. A background writer sends a stream of writes (unique key per write) to any node.
-#   2. Repeatedly: wait for a stable leader, kill it, measure re-election time, restart it.
-#   3. Wait for all nodes to converge, then verify identical committed logs and no lost writes.
+#   2. Repeatedly: wait for a stable leader, kill it, detect the new leader by TERM,
+#      and read how long the cluster was leaderless from the new leader's own clock.
+#   3. Restart the killed node, then verify identical committed logs and no lost writes.
 # Usage: bash failover-test.sh [runs]     (default 5)
 
 RUNS=${1:-5}
 STOP=logs/writer.stop
 ACKED=logs/acked.txt
+mkdir -p logs
 rm -f "$STOP" "$ACKED" logs/nodeF.log
 touch "$ACKED"
 
@@ -39,7 +41,7 @@ writer() {
   done
 }
 
-L=$(wait_for_leader) || { echo "No leader found. Start the cluster first: bash run-cluster.sh"; exit 1; }
+L=$(wait_for_leader) || { echo "No leader found. Start the cluster first."; exit 1; }
 startTerm=$(curl -s localhost:808$L/status | field term)
 writer &
 WPID=$!
@@ -53,26 +55,30 @@ for run in $(seq 1 "$RUNS"); do
   bash kill-node.sh "$L" > /dev/null
   t0=$(now)
 
+  # A new leader = a survivor that is LEADER in a higher term (terms, not clocks)
   new=""
   while [ -z "$new" ] && [ $(( $(now) - t0 )) -lt 10000 ]; do
     for n in 1 2 3 4 5; do
       [ "$n" = "$L" ] && continue
       s=$(curl -s --max-time 1 localhost:808$n/status)
       if echo "$s" | grep -q '"role":"LEADER"'; then
-        new=$n; term=$(echo "$s" | field term); since=$(echo "$s" | field leaderSinceMs)
-        break
+        term=$(echo "$s" | field term)
+        if [ "$term" -gt "$oldTerm" ]; then
+          new=$n
+          gap=$(echo "$s" | field electionGapMs)
+          break
+        fi
       fi
     done
   done
 
   if [ -z "$new" ]; then
     echo "run $run: no new leader within 10 s!"
-  elif [ "$since" -lt "$t0" ]; then
-    echo "run $run: node$new was already leader before the kill, skipped"
+  elif [ "$gap" -lt 0 ]; then
+    echo "run $run: node$new elected in term $term (gap unknown, skipped)"
   else
-    ms=$(( since - t0 ))
-    times+=("$ms")
-    echo "run $run: killed node$L (term $oldTerm) -> node$new elected in term $term after ${ms} ms"
+    times+=("$gap")
+    echo "run $run: killed node$L (term $oldTerm) -> node$new elected in term $term, ${gap} ms after its last heartbeat"
   fi
 
   sleep 1
@@ -88,7 +94,7 @@ echo "writer stopped: $(wc -l < "$ACKED") writes acknowledged"
 if [ ${#times[@]} -gt 0 ]; then
   sorted=$(printf "%s\n" "${times[@]}" | sort -n)
   cnt=${#times[@]}
-  echo "--- re-election time (ms): $(echo $sorted)"
+  echo "--- leaderless time (ms): $(echo $sorted)"
   echo "    min $(echo "$sorted" | head -1)   median $(echo "$sorted" | sed -n "$(( (cnt + 1) / 2 ))p")   p90 $(echo "$sorted" | sed -n "$(( (cnt * 9 + 9) / 10 ))p")   max $(echo "$sorted" | tail -1)"
 fi
 
@@ -121,5 +127,3 @@ echo "RESULT: $lost of $(wc -l < "$ACKED") acknowledged writes lost"
 # ---------- election stability ----------
 endTerm=$(curl -s localhost:808$L/status | field term)
 echo "RESULT: terms used: $(( endTerm - startTerm )) for $RUNS leader kills (ideal: about $RUNS)"
-echo "        pre-votes started: $(cat logs/node[1-5].log | grep -c 'starting pre-vote')," \
-     "real elections: $(cat logs/node[1-5].log | grep -c '> CANDIDATE')"
