@@ -22,7 +22,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Drives Raft: timers, elections, heartbeats, replication, client writes and reads.
+ * Drives Raft: timers, pre-vote and elections, heartbeats, replication, client writes and reads.
  * RaftState holds the data; RaftNode decides when things happen.
  */
 public class RaftNode {
@@ -84,26 +84,20 @@ public class RaftNode {
 
     // ---------- Client reads (ReadIndex) ----------
 
-    /**
-     * Linearizable read barrier. When this returns OK, reading the local store
-     * reflects every write committed before the read started.
-     * Throws NotLeaderException on followers.
-     */
     public ReadResult readBarrier(long timeoutMs) throws InterruptedException {
-        long readIndex = state.readIndex();          // 1. note the commit index
+        long readIndex = state.readIndex();
         if (readIndex < 0) {
-            return ReadResult.LEADER_NOT_READY;      // our NOOP hasn't committed yet
+            return ReadResult.LEADER_NOT_READY;
         }
-        if (!confirmLeadership(timeoutMs)) {        // 2. a majority still follows us
+        if (!confirmLeadership(timeoutMs)) {
             return ReadResult.NO_QUORUM;
         }
-        if (!state.awaitApplied(readIndex, timeoutMs)) {   // 3. state machine has caught up
+        if (!state.awaitApplied(readIndex, timeoutMs)) {
             return ReadResult.TIMEOUT;
         }
         return ReadResult.OK;
     }
 
-    /** One heartbeat round: true if a majority (counting us) answers in our current term. */
     private boolean confirmLeadership(long timeoutMs) throws InterruptedException {
         RaftState.Snapshot s = state.snapshot();
         if (s.role() != Role.LEADER) {
@@ -112,7 +106,7 @@ public class RaftNode {
         long term = s.term();
         int needed = quorum - 1;
         if (needed <= 0) {
-            return true;   // single-node cluster
+            return true;
         }
         CountDownLatch acks = new CountDownLatch(needed);
         for (String peer : peerIds) {
@@ -123,7 +117,6 @@ public class RaftNode {
                 }
                 transport.appendEntries(peer, req).ifPresent(resp -> {
                     state.handleAppendEntriesResponse(peer, req, resp);
-                    // Any reply in our term (even a log mismatch) proves it still follows us
                     if (resp.term() == term) {
                         acks.countDown();
                     }
@@ -146,11 +139,52 @@ public class RaftNode {
     }
 
     private void onElectionTimeout() {
-        if (state.snapshot().role() == Role.LEADER) {
+        RaftState.Snapshot s = state.snapshot();
+        if (s.role() == Role.LEADER) {
             resetElectionTimer();
             return;
         }
-        startElection();
+        startPreVote(s.term());
+    }
+
+    // ---------- Pre-Vote (Raft thesis 9.6) ----------
+
+    /** Ask "would you vote for me?" without touching any term. Only a majority yes starts a real election. */
+    private void startPreVote(long term) {
+        resetElectionTimer();   // if this round fails, we try again after another timeout
+        long roundStartMs = System.currentTimeMillis();
+        long proposedTerm = term + 1;
+        log.info("Election timeout in term {}, starting pre-vote for term {}", term, proposedTerm);
+
+        RequestVoteRequest req = new RequestVoteRequest(
+                proposedTerm, state.selfId(), state.lastLogIndex(), state.lastLogTerm());
+
+        AtomicInteger grants = new AtomicInteger(1);   // we'd vote for ourselves
+        if (grants.get() >= quorum) {
+            startElection();
+            return;
+        }
+        for (String peer : peerIds) {
+            rpcPool.submit(() -> preVoteFrom(peer, req, term, roundStartMs, grants));
+        }
+    }
+
+    private void preVoteFrom(String peer, RequestVoteRequest req, long term, long roundStartMs,
+                             AtomicInteger grants) {
+        transport.preVote(peer, req).ifPresent(resp -> {
+            if (state.stepDownIfNewerTerm(resp.term())) {
+                return;
+            }
+            if (resp.voteGranted() && grants.incrementAndGet() == quorum) {
+                RaftState.Snapshot s = state.snapshot();
+                // Still in the same term, not leader, and no leader contacted us since the round began
+                if (s.term() == term && s.role() != Role.LEADER
+                        && state.lastLeaderContactMs() < roundStartMs) {
+                    log.info("Pre-vote for term {} won, starting election", req.term());
+                    startElection();
+                }
+            }
+        });
     }
 
     // ---------- Running an election ----------
@@ -251,6 +285,11 @@ public class RaftNode {
             resetElectionTimer();
         }
         return resp;
+    }
+
+    /** Pre-votes change nothing, so they don't reset our timer either. */
+    public RequestVoteResponse handlePreVote(RequestVoteRequest req) {
+        return state.handlePreVote(req, electionTimeoutMinMs);
     }
 
     public AppendEntriesResponse handleAppendEntries(AppendEntriesRequest req) {

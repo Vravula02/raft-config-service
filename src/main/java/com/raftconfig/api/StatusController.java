@@ -2,6 +2,7 @@ package com.raftconfig.api;
 
 import com.raftconfig.config.NodeProperties;
 import com.raftconfig.raft.RaftState;
+import com.raftconfig.raft.Role;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -32,6 +33,9 @@ public class StatusController {
         out.put("lastLogTerm", s.lastLogTerm());
         out.put("commitIndex", s.commitIndex());
         out.put("lastApplied", s.lastApplied());
+        if (s.role() == Role.LEADER) {
+            out.put("leaderSinceMs", s.leaderSinceMs());
+        }
         out.put("clusterSize", props.clusterSize());
         out.put("quorum", props.quorum());
         Map<String, Map<String, Long>> progress = state.replicationProgress();
