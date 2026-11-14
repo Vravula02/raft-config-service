@@ -1,0 +1,7 @@
+target/
+logs/
+data/
+.git/
+.vscode/
+.idea/
+*.sh

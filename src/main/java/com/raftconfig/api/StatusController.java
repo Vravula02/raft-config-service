@@ -35,6 +35,7 @@ public class StatusController {
         out.put("lastApplied", s.lastApplied());
         if (s.role() == Role.LEADER) {
             out.put("leaderSinceMs", s.leaderSinceMs());
+            out.put("electionGapMs", state.lastElectionGapMs());
         }
         out.put("clusterSize", props.clusterSize());
         out.put("quorum", props.quorum());

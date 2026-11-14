@@ -43,6 +43,7 @@ public class RaftState {
     private long lastApplied = 0;
     private long leaderSinceMs = 0;   // wall-clock time we last won an election
     private long lastLeaderContactMs = 0;   // last time a valid leader's AppendEntries reached us
+    private long lastElectionGapMs = -1;    // last heartbeat from old leader -> we took office (same clock)
 
     // Leader-only state, reset on every election win
     private final Map<String, Long> nextIndex = new HashMap<>();
@@ -106,6 +107,7 @@ public class RaftState {
         role = Role.LEADER;
         leaderId = selfId;
         leaderSinceMs = System.currentTimeMillis();
+        lastElectionGapMs = lastLeaderContactMs > 0 ? leaderSinceMs - lastLeaderContactMs : -1;
         nextIndex.clear();
         matchIndex.clear();
         LogEntry noop = raftLog.append(currentTerm, NOOP);
@@ -221,6 +223,11 @@ public class RaftState {
         }
         boolean logOk = isCandidateLogUpToDate(req.lastLogIndex(), req.lastLogTerm());
         return new RequestVoteResponse(currentTerm, logOk);
+    }
+
+    /** How long the cluster was leaderless before we won, measured on our own clock. -1 if unknown. */
+    public synchronized long lastElectionGapMs() {
+        return lastElectionGapMs;
     }
 
     public synchronized long lastLeaderContactMs() {

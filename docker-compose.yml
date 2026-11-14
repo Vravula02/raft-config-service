@@ -1,0 +1,70 @@
+# 5-node Raft cluster. Host ports 8081-8085 map to each container's 8080,
+# so the scripts in this repo work unchanged.
+
+x-raft-node: &raft-node
+  image: raft-config-service:latest
+  pull_policy: never       # local image, never try Docker Hub
+  restart: "no"            # a killed node stays down until we start it (fault tests)
+
+x-raft-env: &raft-env
+  SERVER_PORT: "8080"
+  RAFT_PEERS: node1@http://node1:8080,node2@http://node2:8080,node3@http://node3:8080,node4@http://node4:8080,node5@http://node5:8080
+
+services:
+  node1:
+    <<: *raft-node
+    build: .               # only node1 builds; node2-5 reuse the same image
+    container_name: node1
+    hostname: node1
+    environment:
+      <<: *raft-env
+      RAFT_NODE_ID: node1
+    ports: ["8081:8080"]
+    volumes: ["node1-data:/app/data"]
+
+  node2:
+    <<: *raft-node
+    container_name: node2
+    hostname: node2
+    environment:
+      <<: *raft-env
+      RAFT_NODE_ID: node2
+    ports: ["8082:8080"]
+    volumes: ["node2-data:/app/data"]
+
+  node3:
+    <<: *raft-node
+    container_name: node3
+    hostname: node3
+    environment:
+      <<: *raft-env
+      RAFT_NODE_ID: node3
+    ports: ["8083:8080"]
+    volumes: ["node3-data:/app/data"]
+
+  node4:
+    <<: *raft-node
+    container_name: node4
+    hostname: node4
+    environment:
+      <<: *raft-env
+      RAFT_NODE_ID: node4
+    ports: ["8084:8080"]
+    volumes: ["node4-data:/app/data"]
+
+  node5:
+    <<: *raft-node
+    container_name: node5
+    hostname: node5
+    environment:
+      <<: *raft-env
+      RAFT_NODE_ID: node5
+    ports: ["8085:8080"]
+    volumes: ["node5-data:/app/data"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+  node4-data:
+  node5-data:
