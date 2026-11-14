@@ -120,6 +120,18 @@ public class RaftLog {
         }
     }
 
+    /** Release the file handle (on shutdown, and in tests before deleting temp folders). */
+    public void close() {
+        try {
+            if (channel != null) {
+                channel.close();
+                channel = null;
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot close log " + file, e);
+        }
+    }
+
     // ---------- File handling ----------
 
     private void writeAndSync(List<LogEntry> batch) {
