@@ -10,5 +10,6 @@ import java.util.Optional;
 /** How a node sends RPCs to peers. Empty = peer unreachable or timed out. */
 public interface RaftTransport {
     Optional<RequestVoteResponse> requestVote(String peerId, RequestVoteRequest req);
+    Optional<RequestVoteResponse> preVote(String peerId, RequestVoteRequest req);
     Optional<AppendEntriesResponse> appendEntries(String peerId, AppendEntriesRequest req);
 }

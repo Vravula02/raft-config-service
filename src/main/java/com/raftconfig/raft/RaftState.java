@@ -41,6 +41,8 @@ public class RaftState {
     private String leaderId = null;
     private long commitIndex = 0;
     private long lastApplied = 0;
+    private long leaderSinceMs = 0;   // wall-clock time we last won an election
+    private long lastLeaderContactMs = 0;   // last time a valid leader's AppendEntries reached us
 
     // Leader-only state, reset on every election win
     private final Map<String, Long> nextIndex = new HashMap<>();
@@ -103,6 +105,7 @@ public class RaftState {
         }
         role = Role.LEADER;
         leaderId = selfId;
+        leaderSinceMs = System.currentTimeMillis();
         nextIndex.clear();
         matchIndex.clear();
         LogEntry noop = raftLog.append(currentTerm, NOOP);
@@ -201,6 +204,29 @@ public class RaftState {
         return new RequestVoteResponse(currentTerm, false);
     }
 
+        /**
+     * Pre-Vote (Raft thesis 9.6): "would you vote for me in term req.term()?"
+     * Changes NO state. Says no while we still hear from a live leader (leader stickiness),
+     * so one node with delayed heartbeats can't force the whole cluster into a new term.
+     */
+    public synchronized RequestVoteResponse handlePreVote(RequestVoteRequest req, long stickinessMs) {
+        if (req.term() < currentTerm) {
+            return new RequestVoteResponse(currentTerm, false);
+        }
+        boolean leaderAlive = role == Role.LEADER
+                || (leaderId != null && System.currentTimeMillis() - lastLeaderContactMs < stickinessMs);
+        if (leaderAlive) {
+            log.debug("term={} reject pre-vote from {}: leader {} is alive", currentTerm, req.candidateId(), leaderId);
+            return new RequestVoteResponse(currentTerm, false);
+        }
+        boolean logOk = isCandidateLogUpToDate(req.lastLogIndex(), req.lastLogTerm());
+        return new RequestVoteResponse(currentTerm, logOk);
+    }
+
+    public synchronized long lastLeaderContactMs() {
+        return lastLeaderContactMs;
+    }
+
     private boolean isCandidateLogUpToDate(long candLastIndex, long candLastTerm) {
         long myLastTerm = raftLog.lastTerm();
         long myLastIndex = raftLog.lastIndex();
@@ -219,6 +245,7 @@ public class RaftState {
             return new AppendEntriesResponse(currentTerm, false);
         }
         becomeFollower(req.term(), req.leaderId());
+        lastLeaderContactMs = System.currentTimeMillis();
 
         if (raftLog.termAt(req.prevLogIndex()) != req.prevLogTerm()) {
             log.debug("term={} log mismatch at prevLogIndex={} (want term {}, have {})",
@@ -360,6 +387,25 @@ public class RaftState {
         return raftLog.all();
     }
 
+    // ---------- Log consistency check ----------
+
+    public record LogDigest(long commitIndex, String sha256) {}
+
+    /** SHA-256 over committed entries 1..commitIndex, for comparing logs across nodes. */
+    public synchronized LogDigest committedLogDigest() {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            for (long i = 1; i <= commitIndex; i++) {
+                LogEntry e = raftLog.get(i);
+                String line = e.index() + " " + e.term() + " " + e.command() + "\n";
+                md.update(line.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            return new LogDigest(commitIndex, java.util.HexFormat.of().formatHex(md.digest()));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
     // ---------- Persistence ----------
 
     private void persistMetadata() {
@@ -370,7 +416,7 @@ public class RaftState {
 
     public synchronized Snapshot snapshot() {
         return new Snapshot(selfId, currentTerm, role, votedFor, leaderId,
-                raftLog.lastIndex(), raftLog.lastTerm(), commitIndex, lastApplied);
+                raftLog.lastIndex(), raftLog.lastTerm(), commitIndex, lastApplied, leaderSinceMs);
     }
 
     public String selfId() {
@@ -378,5 +424,6 @@ public class RaftState {
     }
 
     public record Snapshot(String nodeId, long term, Role role, String votedFor, String leaderId,
-                           long lastLogIndex, long lastLogTerm, long commitIndex, long lastApplied) {}
-}
+                           long lastLogIndex, long lastLogTerm, long commitIndex, long lastApplied,
+                           long leaderSinceMs) {}
+    }

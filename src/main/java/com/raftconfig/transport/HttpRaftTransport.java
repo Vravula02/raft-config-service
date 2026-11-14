@@ -25,7 +25,6 @@ public class HttpRaftTransport implements RaftTransport {
 
     public HttpRaftTransport(Map<String, String> peerUrls, Duration timeout) {
         this.peerUrls = peerUrls;
-        // Short timeouts: a slow or dead peer must not stall an election
         SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
         factory.setConnectTimeout(timeout);
         factory.setReadTimeout(timeout);
@@ -35,6 +34,11 @@ public class HttpRaftTransport implements RaftTransport {
     @Override
     public Optional<RequestVoteResponse> requestVote(String peerId, RequestVoteRequest req) {
         return post(peerId, "/raft/request-vote", req, RequestVoteResponse.class);
+    }
+
+    @Override
+    public Optional<RequestVoteResponse> preVote(String peerId, RequestVoteRequest req) {
+        return post(peerId, "/raft/pre-vote", req, RequestVoteResponse.class);
     }
 
     @Override
@@ -53,7 +57,6 @@ public class HttpRaftTransport implements RaftTransport {
                     .body(responseType);
             return Optional.ofNullable(resp);
         } catch (Exception e) {
-            // Down or slow peers are normal in Raft; don't spam the logs
             log.debug("RPC to {} failed: {}", peerId, e.getMessage());
             return Optional.empty();
         }

@@ -26,6 +26,11 @@ public class RaftRpcController {
         return node.handleRequestVote(req);
     }
 
+    @PostMapping("/pre-vote")
+    public RequestVoteResponse preVote(@RequestBody RequestVoteRequest req) {
+        return node.handlePreVote(req);
+    }
+
     @PostMapping("/append-entries")
     public AppendEntriesResponse appendEntries(@RequestBody AppendEntriesRequest req) {
         return node.handleAppendEntries(req);
