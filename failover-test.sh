@@ -52,7 +52,11 @@ times=()
 for run in $(seq 1 "$RUNS"); do
   L=$(wait_for_leader) || { echo "run $run: no leader for 15 s, skipping"; continue; }
   oldTerm=$(curl -s localhost:808$L/status | field term)
-  bash kill-node.sh "$L" > /dev/null
+  out=$(bash kill-node.sh "$L")
+  case "$out" in
+    *killed*|*deleted*) ;;
+    *) echo "run $run: could not kill node$L ($out), skipping"; continue ;;
+  esac
   t0=$(now)
 
   # A new leader = a survivor that is LEADER in a higher term (terms, not clocks)

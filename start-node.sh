@@ -1,9 +1,15 @@
 #!/usr/bin/env bash
-# Starts one node, e.g.: bash start-node.sh 3
-#   Docker mode: if a container named nodeN exists, `docker start` it.
-#   Local mode:  launch the jar on port 808N (appends to logs/nodeN.log).
+# Starts one node by number (1-5), e.g.: bash start-node.sh 3
+#   Kubernetes:     nothing to do, the StatefulSet recreates deleted pods by itself.
+#   Docker compose: `docker start nodeN`.
+#   Local:          launch the jar on port 808N (appends to logs/nodeN.log).
 n=$1
 if [ -z "$n" ]; then echo "usage: bash start-node.sh <1-5>"; exit 1; fi
+
+if command -v kubectl > /dev/null 2>&1 && kubectl get statefulset raft --request-timeout=10s > /dev/null 2>&1; then
+  echo "raft-$((n - 1)) is recreated automatically by the StatefulSet"
+  exit 0
+fi
 
 if command -v docker > /dev/null 2>&1 && docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "node$n"; then
   docker start "node$n" > /dev/null && echo "started container node$n"

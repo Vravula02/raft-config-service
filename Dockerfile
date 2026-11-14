@@ -21,8 +21,10 @@ WORKDIR /app
 COPY --from=build /build/target/raft-config-service-0.1.0-SNAPSHOT.jar app.jar
 USER raft
 
+# Short DNS cache: in Kubernetes a recreated pod comes back with a new IP,
+# and the JVM's default 30 s cache would keep sending RPCs to the old one
 ENV SERVER_PORT=8080 \
-    JAVA_OPTS="-Xmx256m"
+    JAVA_OPTS="-Xmx256m -Dsun.net.inetaddr.ttl=1 -Dsun.net.inetaddr.negative.ttl=0"
 EXPOSE 8080
 
 # exec: java becomes PID 1 and receives SIGTERM directly, so Spring shuts down cleanly
